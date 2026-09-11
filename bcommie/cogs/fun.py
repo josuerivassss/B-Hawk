@@ -117,6 +117,8 @@ class Fun(commands.Cog):
 
     # Image Manipulation Commands
     @commands.hybrid_group(name="edit")
+    @discord.app_commands.allowed_installs(guilds=True, users=True)
+    @discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def edit(self, ctx: CommieContext):
         """Image manipulation commands"""
         if ctx.invoked_subcommand is None:
@@ -338,6 +340,8 @@ class Fun(commands.Cog):
     @commands.cooldown(1, 7, commands.BucketType.user)
     @commands.hybrid_command(name="caption")
     @discord.app_commands.describe(user="Whose image to caption (optional)", text="The caption text")
+    @discord.app_commands.allowed_installs(guilds=True, users=True)
+    @discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def caption(self, ctx: CommieContext, user: Optional[discord.User], *, text: str):
         """Adds a meme-style caption bar (black text on white) above an image"""
         await ctx.think()
@@ -367,6 +371,8 @@ class Fun(commands.Cog):
 
     @commands.cooldown(1, 6, commands.BucketType.user)
     @commands.hybrid_command(name="gif")
+    @discord.app_commands.allowed_installs(guilds=True, users=True)
+    @discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def to_gif(self, ctx: CommieContext):
         """Converts an image into a single-frame GIF, handy for saving to favorites"""
         await ctx.think()
