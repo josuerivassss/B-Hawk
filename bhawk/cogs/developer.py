@@ -1,0 +1,574 @@
+"""Developer/owner-only cog: diagnostics, hot-reload, API key management, and the /help entry point."""
+import discord, sys, datetime, io, json, secrets, hashlib, asyncio, os
+from datetime import timedelta, timezone
+from typing import Literal
+from discord.ext import commands
+from bhawk.kernel import HawkBot, HawkContext, HawkEmojis
+from bhawk.help import send_help, send_help_cog, send_help_group, send_help_command
+from bhawk.kernel import AnswerType
+from bhawk.ui.paginator import Paginator
+from bhawk.introspection import build_commands_snapshot
+from bhawk.timeparse import format_duration_compound
+from bhawk.logging_setup import get_logger
+from bhawk.permissions import protected
+
+logger = get_logger(__name__)
+
+_GIT_COMMAND_TIMEOUT_SECONDS = 60
+_SHELL_OUTPUT_INLINE_LIMIT = 1500  # above this, send as a .txt attachment instead
+
+_BOT_INVITE_URL = "https://discord.com/oauth2/authorize?client_id=1449864932731392223&permissions=8&scope=bot+applications.commands"
+_DISCORD_INVITE_URL = "https://discord.gg/SY5D4x3RB3"
+_WEB_URL = "https://hawk.cofue.space"
+
+_INTROSPECTION_EXCLUDED_COGS = {"Developer", "Events", "Jishaku"}
+
+_PARTNER_MIN_GUILDS = 2
+_PARTNER_MIN_HUMAN_MEMBERS = 5
+_API_BASE_URL = "https://service.cofue.space"
+
+
+def _is_key_hash(value: str) -> bool:
+    return len(value) == 64 and all(c in "0123456789abcdef" for c in value.lower())
+
+
+def _qualifying_guilds(bot: HawkBot, user_id: int) -> list[discord.Guild]:
+    qualifying = []
+    for g in bot.guilds:
+        if g.owner_id != user_id:
+            continue
+        human_count = sum(1 for m in g.members if not m.bot)
+        if human_count > _PARTNER_MIN_HUMAN_MEMBERS:
+            qualifying.append(g)
+    return qualifying
+
+
+class Developer(commands.Cog):
+    def __init__(self, bot: HawkBot):
+        self.bot = bot
+
+    @commands.hybrid_command(name="ping")
+    async def ping(self, ctx: HawkContext):
+        """Returns pong"""
+        T = await ctx.get_locale()
+        await ctx.send(T.get("ping", ms=round(self.bot.latency, 2)))
+
+    @protected
+    @commands.hybrid_command(name="invite")
+    @discord.app_commands.allowed_installs(guilds=True, users=True)
+    @discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def invite(self, ctx: HawkContext):
+        """Shows the bot & support server invite"""
+        T = await ctx.get_locale()
+        view = discord.ui.View().add_item(
+            discord.ui.Button(style=discord.ButtonStyle.link, label="Invite bot", url=_BOT_INVITE_URL),
+        ).add_item(
+            discord.ui.Button(style=discord.ButtonStyle.link, label="Discord server", url=_DISCORD_INVITE_URL)
+        ).add_item(
+            discord.ui.Button(style=discord.ButtonStyle.link, label="Web", url=_WEB_URL)
+        )
+        await ctx.answer(T.get("inviteDescription"), type=AnswerType.Ok, view=view, bold=False)
+
+    @protected
+    @commands.is_owner()
+    @commands.hybrid_command(name="reload")
+    @discord.app_commands.describe(name="Cog name to reload (e.g. 'moderation')", sync_too="Whether to sync slash commands after reloading")
+    async def dev_reload(self, ctx: HawkContext, name: str, sync_too: bool = False):
+        """Hot-reloads a cog by name, without restarting the process/shard."""
+        extension = f"bhawk.cogs.{name.lower()}"
+        old = ctx.bot.commands
+        try:
+            await ctx.bot.reload_extension(extension)
+        except commands.ExtensionNotFound as exc:
+            raise commands.CommandError(f"No cog named **{name}**.") from exc
+        except commands.ExtensionError as exc:
+            raise commands.CommandError(f"Failed to reload **{name}**: {exc}") from exc
+        view = (
+            discord.ui.View()
+            .add_item(discord.ui.Button(style=discord.ButtonStyle.blurple, label="Commands", custom_id="general", disabled=True))
+            .add_item(discord.ui.Button(style=discord.ButtonStyle.red, label=f"Before: {len(old)}", custom_id="before", disabled=True))
+            .add_item(discord.ui.Button(style=discord.ButtonStyle.green, label=f"After: {len(ctx.bot.commands)}", custom_id="after", disabled=True))
+        )
+        if sync_too:
+            self.bot.slash_cache = await self.bot.tree.sync()
+        await ctx.answer(f"**{name}** successfully reloaded!", bold=False, view=view, type=AnswerType.Ok)
+
+    async def _run_shell(self, *args: str, cwd: str | None = None, timeout: float = _GIT_COMMAND_TIMEOUT_SECONDS) -> tuple[int, str]:
+        """Runs a subprocess and returns (exit_code, combined_output). Never
+        raises on non-zero exit -- the caller inspects the exit code."""
+        process = await asyncio.create_subprocess_exec(
+            *args, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            return -1, f"Command timed out after {timeout}s."
+        return process.returncode, stdout.decode(errors="replace").strip()
+
+    async def _reply_shell_output(self, ctx: HawkContext, title: str, exit_code: int, output: str) -> None:
+        status = "✅" if exit_code == 0 else "❌"
+        header = f"{status} **{title}** (exit code `{exit_code}`)"
+        body = output or "*(no output)*"
+        if len(body) <= _SHELL_OUTPUT_INLINE_LIMIT:
+            await ctx.send(f"{header}\n```\n{body}\n```")
+        else:
+            file = discord.File(io.BytesIO(body.encode("utf-8")), filename="output.txt")
+            await ctx.send(content=header, file=file)
+
+    @commands.is_owner()
+    @commands.hybrid_group(name="git")
+    async def git(self, ctx: HawkContext):
+        """Runs git operations against the bot's own repo (owner-only)"""
+        if ctx.invoked_subcommand is None:
+            cmd = self.bot.get_command("git")
+            await send_help_group(ctx, cmd, self.bot.slash_cache, await ctx.get_locale())
+
+    @commands.is_owner()
+    @git.command(name="pull")
+    async def git_pull(self, ctx: HawkContext):
+        """Runs `git pull` in the bot's working directory"""
+        await ctx.defer()
+        repo_dir = os.getcwd()
+        exit_code, output = await self._run_shell("git", "pull", "--ff-only", cwd=repo_dir)
+        await self._reply_shell_output(ctx, "git pull", exit_code, output)
+
+    @commands.is_owner()
+    @git.command(name="status")
+    async def git_status(self, ctx: HawkContext):
+        """Shows `git status` for the bot's working directory"""
+        await ctx.defer()
+        repo_dir = os.getcwd()
+        exit_code, output = await self._run_shell("git", "status", "--short", "--branch", cwd=repo_dir)
+        await self._reply_shell_output(ctx, "git status", exit_code, output)
+
+    @commands.is_owner()
+    @git.command(name="log")
+    @discord.app_commands.describe(amount="Number of recent commits to show (1-20)")
+    async def git_log(self, ctx: HawkContext, amount: commands.Range[int, 1, 20] = 5):
+        """Shows the most recent commits"""
+        await ctx.defer()
+        repo_dir = os.getcwd()
+        exit_code, output = await self._run_shell(
+            "git", "log", f"-{amount}", "--oneline", "--decorate", cwd=repo_dir
+        )
+        await self._reply_shell_output(ctx, f"git log -{amount}", exit_code, output)
+    
+    @commands.cooldown(1, 8, commands.BucketType.user)
+    @commands.hybrid_command(name="interpolate", extras={"supports_placeholders": True})
+    @commands.is_owner()
+    @discord.app_commands.describe(text="The text to interpolate with locale placeholders")
+    async def interpolate(self, ctx: HawkContext, *, text: str):
+        """Interpolates a string with locale placeholders"""
+        await ctx.send_render(text)
+
+    @protected
+    @commands.cooldown(1, 8, commands.BucketType.member)
+    @commands.hybrid_command(name="help")
+    async def help_command(self, ctx: HawkContext, *, query: str = None):
+        """Get help about the bot
+        
+        Parameters
+        ----
+        query: str
+            The command or subcommand to get help about.
+        """
+        await ctx.defer()
+        T = await ctx.get_locale()
+        if not query:
+            await send_help(ctx, self.bot.slash_cache, T)
+        else:
+            cog = self.bot.get_cog(query.title())
+            if cog:
+                await send_help_cog(ctx, query.title(), self.bot.slash_cache, T)
+            else:
+                cmd = self.bot.get_command(query.lower())
+                if isinstance(cmd, commands.HybridGroup):
+                    await send_help_group(ctx, cmd, self.bot.slash_cache, T)
+                elif isinstance(cmd, commands.HybridCommand):
+                    await send_help_command(ctx, cmd, self.bot.slash_cache, T)
+                else:
+                    await ctx.send(T.get("help.notFound", query=query))
+    
+    @commands.hybrid_command(name="uptime")
+    async def uptime(self, ctx: HawkContext):
+        """Shows bot uptime"""
+        elapsed = datetime.datetime.now(datetime.UTC) - self.bot.start_time
+        await ctx.send(f"Uptime: {format_duration_compound(elapsed.total_seconds())}")
+
+    @protected
+    @commands.hybrid_command(name="dashboard", aliases=["web", "website", "dash"])
+    @discord.app_commands.allowed_installs(guilds=True, users=True)
+    @discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def dashboard(self, ctx: HawkContext):
+        """Shows the bot's web dashboard URL"""
+        T = await ctx.get_locale()
+        view = discord.ui.View().add_item(
+            discord.ui.Button(style=discord.ButtonStyle.link, label="Dashboard", url=_WEB_URL+"/dash")
+        )
+        await ctx.answer(T.get("dashboardDescription"), type=AnswerType.Ok, view=view, bold=False)
+
+    @protected
+    @commands.hybrid_command(name="info", aliases=["software", "botinfo"])
+    @discord.app_commands.allowed_installs(guilds=True, users=True)
+    @discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def info(self, ctx: HawkContext):
+        """Shows information about the bot, including shard/cluster placement."""
+        uptime = datetime.datetime.now(datetime.UTC) - self.bot.start_time
+        shard_id = ctx.guild.shard_id if ctx.guild else 0
+        embed = discord.Embed(colour=discord.Color.dark_blue())
+        embed.set_thumbnail(url=str(ctx.bot.user.display_avatar).replace(".webp", ".png"))
+        embed.add_field(name="Developer", value="@cofue", inline=True)
+        embed.add_field(name="Servers", value=len(ctx.bot.guilds), inline=True)
+        embed.add_field(name="Users", value=len(ctx.bot.users), inline=True)
+        embed.add_field(name="Commands", value=len(ctx.bot.commands), inline=True)
+        embed.add_field(name="Uptime", value=format_duration_compound(uptime.total_seconds()), inline=True)
+        embed.add_field(name="Latency", value=f"{round(self.bot.latency * 1000, 2)} ms", inline=True)
+        embed.add_field(name="Shard", value=f"{shard_id} / {self.bot.shard_count or 1}", inline=True)
+        embed.add_field(name="Cluster", value=str(self.bot.settings.cluster_id), inline=True)
+        embed.add_field(name="Library", value=f"discord.py@{discord.__version__}", inline=True)
+        embed.add_field(name="Version", value=str(self.bot.settings.version), inline=True)
+        embed.add_field(name="Python", value=sys.version.split(' ')[0], inline=True)
+        embed.add_field(name="Platform", value=sys.platform, inline=True)
+        await ctx.send(content="Here's my software specifications! " + HawkEmojis.Developer, embed=embed)
+    
+    @commands.is_owner()
+    @commands.hybrid_group(name="dashboardmanager")
+    async def dashboardmanager(self, ctx: HawkContext):
+        """Manages web dashboard access (owner-only)"""
+        if ctx.invoked_subcommand is None:
+            cmd = self.bot.get_command("dashboard")
+            await send_help_group(ctx, cmd, self.bot.slash_cache, await ctx.get_locale())
+
+    @commands.is_owner()
+    @dashboardmanager.command(name="grant")
+    @discord.app_commands.describe(user="The Discord user to grant dashboard access to")
+    async def dashboard_grant(self, ctx: HawkContext, user: discord.User):
+        """Grants a user access to the web dashboard"""
+        await ctx.defer()
+        # Single existence check avoids an unnecessary write when already granted
+        if await self.bot.db.exists(table="dashboard_access", id=user.id):
+            await ctx.answer(f"**{user}** already has dashboard access.", type=AnswerType.Info)
+            return
+        await self.bot.db.set(
+            table="dashboard_access",
+            id=user.id,
+            data={"granted_by": ctx.author.id, "granted_at": int(discord.utils.utcnow().timestamp())},
+        )
+        await ctx.answer(f"Dashboard access granted to **{user}**.", type=AnswerType.Ok)
+
+    @commands.is_owner()
+    @dashboardmanager.command(name="revoke")
+    @discord.app_commands.describe(user="The Discord user to revoke dashboard access from")
+    async def dashboard_revoke(self, ctx: HawkContext, user: discord.User):
+        """Revokes a user's access to the web dashboard"""
+        await ctx.defer()
+        deleted = await self.bot.db.delete(table="dashboard_access", id=user.id)
+        if not deleted:
+            await ctx.answer(f"**{user}** does not have dashboard access.", type=AnswerType.Info)
+            return
+        await ctx.answer(f"Dashboard access revoked from **{user}**.", type=AnswerType.Ok)
+    
+    @commands.is_owner()
+    @dashboardmanager.command(name="list")
+    async def dashboard_list(self, ctx: HawkContext):
+        """Lists every user currently authorized to use the web dashboard"""
+        await ctx.defer()
+        T = await ctx.get_locale()
+        authorized = await self.bot.db.find(table="dashboard_access", filter={}, projection={"_id": 1})
+        if not authorized:
+            await ctx.answer("No users currently have dashboard access.", type=AnswerType.Info)
+            return
+
+        PER_PAGE = 10
+        pages: list[list[dict]] = [authorized[i:i + PER_PAGE] for i in range(0, len(authorized), PER_PAGE)]
+        embed = discord.Embed(title="Dashboard Access", colour=discord.Color.dark_blue())
+        embed.set_author(name=ctx.guild.name if ctx.guild else self.bot.user.name, icon_url=self.bot.user.display_avatar)
+
+        def render(page_items: list[dict], page: int, total: int):
+            embed.description = "\n".join(f"<@{doc['_id']}> (`{doc['_id']}`)" for doc in page_items)
+            embed.set_footer(text=T.get("paginator.footer", page=page + 1, total=total))
+
+        paginator = Paginator(data=pages, ctx=ctx, locale=T, embed=embed, render=render)
+        paginator.update_item()
+        paginator.message = await ctx.send(embed=embed, view=paginator)
+
+    @commands.is_owner()
+    @commands.hybrid_group(name="blacklist")
+    async def blacklist(self, ctx: HawkContext):
+        """Manages the bot's user/guild blacklist (owner-only)"""
+        if ctx.invoked_subcommand is None:
+            cmd = self.bot.get_command("blacklist")
+            await send_help_group(ctx, cmd, self.bot.slash_cache, await ctx.get_locale())
+
+    @commands.is_owner()
+    @blacklist.command(name="add")
+    @discord.app_commands.describe(
+        target="Discord user or guild ID to blacklist",
+        kind="Whether the ID belongs to a user or a guild",
+        reason="Why this entity is being blacklisted",
+    )
+    async def blacklist_add(self, ctx: HawkContext, target: str, kind: Literal["user", "guild"] = "user", *, reason: str = "No reason provided"):
+        """Blacklists a user or guild and wipes its stored data"""
+        await ctx.defer()
+        entity_id = self._parse_snowflake(target)
+        if entity_id is None:
+            raise commands.CommandError(f"`{target}` is not a valid ID.")
+        added = await self.bot.blacklist.add(entity_id, kind, reason=reason, blacklisted_by=ctx.author.id)
+        if not added:
+            await ctx.answer(f"That {kind} is already blacklisted.", type=AnswerType.Info)
+            return
+        await self._notify_owners_of_blacklist(entity_id, kind, reason, ctx.author)
+        await ctx.answer(f"**{entity_id}** (`{kind}`) has been blacklisted and its stored data purged.", type=AnswerType.Ok, bold=False)
+
+    @commands.is_owner()
+    @blacklist.command(name="remove", aliases=["delete"])
+    @discord.app_commands.describe(target="Discord user or guild ID to remove from the blacklist", kind="Whether the ID belongs to a user or a guild")
+    async def blacklist_remove(self, ctx: HawkContext, target: str, kind: Literal["user", "guild"] = "user"):
+        """Removes a user or guild from the blacklist"""
+        await ctx.defer()
+        entity_id = self._parse_snowflake(target)
+        if entity_id is None:
+            raise commands.CommandError(f"`{target}` is not a valid ID.")
+        removed = await self.bot.blacklist.remove(entity_id, kind)
+        if not removed:
+            await ctx.answer(f"That {kind} is not blacklisted.", type=AnswerType.Info)
+            return
+        await ctx.answer(f"**{entity_id}** (`{kind}`) has been removed from the blacklist.", type=AnswerType.Ok, bold=False)
+
+    @commands.is_owner()
+    @blacklist.command(name="list", aliases=["show"])
+    async def blacklist_list(self, ctx: HawkContext):
+        """Lists every blacklisted user and guild"""
+        await ctx.defer()
+        entries = await self.bot.blacklist.list_all()
+        if not entries:
+            await ctx.answer("The blacklist is empty.", type=AnswerType.Info)
+            return
+
+        PER_PAGE = 10
+        pages = [entries[i:i + PER_PAGE] for i in range(0, len(entries), PER_PAGE)]
+        embed = discord.Embed(title="Blacklist", colour=discord.Color.dark_blue())
+        embed.set_author(name=ctx.guild.name if ctx.guild else self.bot.user.name, icon_url=self.bot.user.display_avatar)
+        T = await ctx.get_locale()
+
+        def render(page_items: list[dict], page: int, total: int):
+            lines = []
+            for doc in page_items:
+                timestamp = f"<t:{doc['blacklisted_at']}:R>" if doc.get("blacklisted_at") else "unknown"
+                lines.append(f"**{doc['_id']}** (`{doc.get('type', 'user')}`) — {doc.get('reason', 'No reason provided')} · {timestamp}")
+            embed.description = "\n".join(lines)
+            embed.set_footer(text=T.get("paginator.footer", page=page + 1, total=total))
+
+        paginator = Paginator(data=pages, ctx=ctx, locale=T, embed=embed, render=render)
+        paginator.update_item()
+        paginator.message = await ctx.send(embed=embed, view=paginator)
+
+    @staticmethod
+    def _parse_snowflake(raw: str) -> int | None:
+        try:
+            return int(raw.strip("<@!>"))
+        except ValueError:
+            return None
+
+    async def _notify_owners_of_blacklist(self, entity_id: int, kind: str, reason: str, moderator: discord.abc.User) -> None:
+        """DMs every bot owner about a new blacklist entry -- the blacklisted entity itself is never notified."""
+        message = f"🔨 **Blacklist added**\nTarget: `{entity_id}` (`{kind}`)\nReason: {reason}\nBy: {moderator} (`{moderator.id}`)"
+        for owner_id in self.bot.owner_ids:
+            try:
+                owner = self.bot.get_user(owner_id) or await self.bot.fetch_user(owner_id)
+                await owner.send(message)
+            except discord.HTTPException:
+                logger.warning("blacklist_owner_dm_failed", owner_id=owner_id)
+
+    def _api_keys(self):
+        return self.bot.db.db["api_keys"]
+
+    async def _refresh_api_cache(self):
+        await self.bot.toolkit.request(
+            method="POST",
+            url=f"{self.bot.settings.api_base_url}/admin/refresh-keys",
+            headers={"X-Internal-Secret": self.bot.settings.api_admin_secret},
+        )
+
+    @commands.is_owner()
+    @commands.hybrid_group(name="api")
+    async def api(self, ctx: HawkContext):
+        """Manages API key access (owner-only)"""
+        if ctx.invoked_subcommand is None:
+            cmd = self.bot.get_command("api")
+            await send_help_group(ctx, cmd, self.bot.slash_cache, await ctx.get_locale())
+
+    @commands.is_owner()
+    @api.command(name="grant")
+    @discord.app_commands.describe(user="Target user", plan="basic | pro | partner | test", duration_hours="Pro validity in hours (default 48)")
+    async def api_grant(self, ctx: HawkContext, user: discord.User, plan: Literal["basic", "pro", "partner", "test"], duration_hours: int = 48):
+        """Grants or updates an API key for a user"""
+        await ctx.defer()
+        collection = self._api_keys()
+        raw_key = secrets.token_urlsafe(32)
+        key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+        expires_at = datetime.datetime.now(timezone.utc) + timedelta(hours=duration_hours) if plan == "pro" else None
+        data = {"key_hash": key_hash, "discord_id": str(user.id), "plan": plan, "banned": False, "expires_at": expires_at}
+        existing = await collection.find_one({"discord_id": str(user.id)})
+        if existing:
+            await collection.update_one({"_id": existing["_id"]}, {"$set": data})
+        else:
+            await collection.insert_one(data)
+        await self._refresh_api_cache()
+        try:
+            # await user.send(f"Your new API key: `{raw_key}`\nPlan: **{plan}**\nKeep it secret, it won't be shown again.")
+            await user.send(f"**Hawk Service**\n\nYour new API key: `{raw_key}`\nPlan: **`{plan.upper()}`**\nURL: {_API_BASE_URL}\n\nKeep it secret, it won't be shown again.\n\nIf you have any questions, join the support server: {_DISCORD_INVITE_URL}")
+            delivered = True
+        except discord.Forbidden:
+            delivered = False
+        msg = f"**Granted** **{plan.upper()}** plan to {user}."
+        if not delivered:
+            msg += " Could not DM the key (DMs closed) -- use `/api regenerate` once they open DMs."
+        await ctx.answer(msg, type="success", bold=False)
+
+    @commands.is_owner()
+    @api.command(name="revoke")
+    @discord.app_commands.describe(target="User mention/ID or the key's hash")
+    async def api_revoke(self, ctx: HawkContext, target: str):
+        """Revokes an API key by user or key hash"""
+        await ctx.defer()
+        target = target.strip("<@!>")
+        query = {"key_hash": target} if _is_key_hash(target) else {"discord_id": target}
+        result = await self._api_keys().delete_one(query)
+        if result.deleted_count == 0:
+            raise commands.CommandError("No matching API key found.")
+        await self._refresh_api_cache()
+        await ctx.answer(f"**Revoked** API key for `{target}`.", type="success", bold=False)
+
+    @commands.is_owner()
+    @api.command(name="ban")
+    @discord.app_commands.describe(user="User to ban from API access")
+    async def api_ban(self, ctx: HawkContext, user: discord.User):
+        """Bans a user's API key without deleting it"""
+        await ctx.defer()
+        result = await self._api_keys().update_one({"discord_id": str(user.id)}, {"$set": {"banned": True}})
+        if result.matched_count == 0:
+            raise commands.CommandError(f"{user} has no API key.")
+        await self._refresh_api_cache()
+        await ctx.answer(f"**Banned** API access for {user}.", type="success", bold=False)
+
+    @commands.is_owner()
+    @api.command(name="check")
+    @discord.app_commands.describe(user="User to check for Partner eligibility")
+    async def api_check(self, ctx: HawkContext, user: discord.User):
+        """Checks if a user currently qualifies for the Partner plan"""
+        await ctx.defer()
+        qualifying = _qualifying_guilds(self.bot, user.id)
+        eligible = len(qualifying) >= _PARTNER_MIN_GUILDS
+        embed = discord.Embed(title=f"Partner eligibility: {user}", colour=discord.Color.green() if eligible else discord.Color.red())
+        embed.add_field(name="Qualifying servers", value=str(len(qualifying)), inline=False)
+        embed.add_field(name="Required", value=f"{_PARTNER_MIN_GUILDS} servers, >{_PARTNER_MIN_HUMAN_MEMBERS} humans each", inline=False)
+        embed.add_field(name="Eligible", value="✅" if eligible else "❌")
+        if qualifying:
+            embed.add_field(name="Servers", value="\n".join(g.name for g in qualifying[:10]), inline=False)
+        await ctx.send(embed=embed)
+
+    @commands.is_owner()
+    @api.command(name="checkall")
+    @discord.app_commands.describe(enforce="Downgrade ineligible partners to basic instead of just reporting")
+    async def api_checkall(self, ctx: HawkContext, enforce: bool = False):
+        """Audits every Partner key against current ownership/member requirements"""
+        await ctx.defer()
+        collection = self._api_keys()
+        partners = await collection.find({"plan": "partner"}).to_list(length=None)
+        ineligible = []
+        for doc in partners:
+            qualifying = _qualifying_guilds(self.bot, int(doc["discord_id"]))
+            if len(qualifying) < _PARTNER_MIN_GUILDS:
+                ineligible.append((doc, len(qualifying)))
+        if enforce and ineligible:
+            for doc, _count in ineligible:
+                await collection.update_one({"_id": doc["_id"]}, {"$set": {"plan": "basic"}})
+            await self._refresh_api_cache()
+        lines = [f"<@{d['discord_id']}> ({count}/{_PARTNER_MIN_GUILDS})" for d, count in ineligible] or ["None"]
+        title = "Partner audit (enforced)" if enforce else "Partner audit (report only)"
+        embed = discord.Embed(title=title, description="\n".join(lines), colour=discord.Color.dark_blue())
+        embed.set_footer(text=f"{len(ineligible)} ineligible out of {len(partners)} partners")
+        await ctx.send(embed=embed)
+
+    @commands.is_owner()
+    @api.command(name="info")
+    @discord.app_commands.describe(target="User mention/ID or the key's hash")
+    async def api_info(self, ctx: HawkContext, target: str):
+        """Shows raw API key data for a user or key hash"""
+        await ctx.defer()
+        target = target.strip("<@!>")
+        query = {"key_hash": target} if _is_key_hash(target) else {"discord_id": target}
+        doc = await self._api_keys().find_one(query)
+        if not doc:
+            raise commands.CommandError("No matching API key found.")
+        embed = discord.Embed(title="API Key Info", colour=discord.Color.dark_blue())
+        embed.add_field(name="Discord ID", value=doc["discord_id"], inline=False)
+        embed.add_field(name="Plan", value=doc["plan"], inline=False)
+        embed.add_field(name="Banned", value="✅" if doc["banned"] else "❌", inline=False)
+        embed.add_field(name="Expires", value=doc["expires_at"].strftime("%Y-%m-%d %H:%M UTC") if doc.get("expires_at") else "Never", inline=False)
+        await ctx.send(embed=embed)
+
+    @commands.is_owner()
+    @api.command(name="usage")
+    @discord.app_commands.describe(target="User mention/ID or the key's hash")
+    async def api_usage(self, ctx: HawkContext, target: str):
+        """Shows today's request count for a key, read live from the API"""
+        await ctx.defer()
+        target = target.strip("<@!>")
+        query = {"key_hash": target} if _is_key_hash(target) else {"discord_id": target}
+        doc = await self._api_keys().find_one(query)
+        if not doc:
+            raise commands.CommandError("No matching API key found.")
+        response = await self.bot.toolkit.request(
+            method="GET",
+            url=f"{self.bot.settings.api_base_url}/admin/usage/{doc['key_hash']}",
+            headers={"X-Internal-Secret": self.bot.settings.api_admin_secret},
+        )
+        if not response:
+            raise commands.CommandError("Could not reach the API server.")
+        usage_data = response.get("data", response)
+        limit = usage_data.get("limit")
+        embed = discord.Embed(title="API Key Usage", colour=discord.Color.dark_blue())
+        embed.add_field(name="Discord ID", value=usage_data.get("discord_id"), inline=False)
+        embed.add_field(name="Plan", value=usage_data.get("plan"), inline=False)
+        embed.add_field(name="Used today", value=f"{usage_data.get('used')}/{limit if limit is not None else '∞'}", inline=False)
+        await ctx.send(embed=embed)
+
+    @commands.is_owner()
+    @api.command(name="regenerate")
+    @discord.app_commands.describe(user="User whose key will be regenerated")
+    async def api_regenerate(self, ctx: HawkContext, user: discord.User):
+        """Issues a new key for a user, invalidating the previous one"""
+        await ctx.defer()
+        collection = self._api_keys()
+        existing = await collection.find_one({"discord_id": str(user.id)})
+        if not existing:
+            raise commands.CommandError(f"{user} has no API key.")
+        raw_key = secrets.token_urlsafe(32)
+        key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+        await collection.update_one({"_id": existing["_id"]}, {"$set": {"key_hash": key_hash}})
+        await self._refresh_api_cache()
+        try:
+            await user.send(f"**Hawk Service**\nYour regenerated API key: `{raw_key}`\n\nThe previous key stopped working immediately.")
+            delivered = True
+        except discord.Forbidden:
+            delivered = False
+        msg = f"**Regenerated** API key for {user}."
+        if not delivered:
+            msg += " Could not DM the new key (DMs closed)."
+        await ctx.answer(msg, type="success", bold=False)
+
+    @commands.is_owner()
+    @commands.command(name="fetchcommands")
+    async def fetch_commands(self, ctx: HawkContext):
+        """Dumps every command's metadata (cooldowns, permissions, slash IDs) as JSON"""
+        snapshot = build_commands_snapshot(self.bot, _INTROSPECTION_EXCLUDED_COGS)
+        payload = json.dumps(snapshot, indent=2, ensure_ascii=False).encode("utf-8")
+        file = discord.File(io.BytesIO(payload), filename=f"commands-{int(discord.utils.utcnow().timestamp())}.json")
+        await ctx.send(content=f"Serialized **{snapshot['command_count']}** top-level commands.", file=file)
+
+async def setup(bot: HawkBot):
+    await bot.add_cog(Developer(bot))

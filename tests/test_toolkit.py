@@ -1,11 +1,11 @@
-"""Unit tests for bcommie.toolkit validation/formatting helpers.
+"""Unit tests for bhawk.toolkit validation/formatting helpers.
 
 These only exercise pure functions; HTTP/emoji-CDN behavior is covered by
 integration tests (see README.md).
 """
 import pytest
 
-from bcommie.toolkit import ToolKit
+from bhawk.toolkit import ToolKit
 
 
 @pytest.fixture

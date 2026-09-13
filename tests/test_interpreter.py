@@ -1,14 +1,14 @@
-"""Unit tests for bcommie.interpolation.interpreter and interpolator."""
+"""Unit tests for bhawk.interpolation.interpreter and interpolator."""
 import pytest
 
-from bcommie.interpolation.decorators import PlaceholderType, placeholder
-from bcommie.interpolation.interpolator import InterpolationEngine
-from bcommie.interpolation.interpreter import MAX_NESTING, Interpreter
-from bcommie.interpolation.lexer import lex
+from bhawk.interpolation.decorators import PlaceholderType, placeholder
+from bhawk.interpolation.interpolator import InterpolationEngine
+from bhawk.interpolation.interpreter import MAX_NESTING, Interpreter
+from bhawk.interpolation.lexer import lex
 
 
 class _FakeCtx:
-    """Minimal stand-in for CommieContext, just enough for placeholder handlers."""
+    """Minimal stand-in for HawkContext, just enough for placeholder handlers."""
 
     def __init__(self, name: str = "Ada"):
         self.author = type("Author", (), {"name": name})()

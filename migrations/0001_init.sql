@@ -1,6 +1,6 @@
--- B-Commie v2 — initial PostgreSQL schema.
+-- B-Hawk v2 — initial PostgreSQL schema.
 -- Apply with: psql "$POSTGRES_DSN" -f migrations/0001_init.sql
--- (or via the `bcommie-migrate` helper described in README.md)
+-- (or via the `bhawk-migrate` helper described in README.md)
 
 BEGIN;
 

@@ -1,11 +1,11 @@
 [project]
-name = "bcommie"
+name = "hawk"
 version = "2.0.0"
-description = "B-Commie: a scalable, multi-shard Discord bot with a dual-database persistence layer."
+description = "B-Hawk: a powerfull aio discord bot."
 readme = "README.md"
 requires-python = ">=3.13"
 license = { text = "MIT" }
-authors = [{ name = "B-Commie Contributors" }]
+authors = [{ name = "B-Hawk Contributors" }]
 
 dependencies = [
     "discord.py==2.7.1",
@@ -43,7 +43,7 @@ dev = [
 ]
 
 [project.scripts]
-bcommie = "bcommie.main:run"
+bhawk = "bhawk.main:run"
 
 [build-system]
 requires = ["setuptools>=69", "wheel"]
@@ -86,4 +86,4 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "-ra --cov=bcommie --cov-report=term-missing"
+addopts = "-ra --cov=bhawk --cov-report=term-missing"

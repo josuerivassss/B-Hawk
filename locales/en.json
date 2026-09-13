@@ -1,7 +1,7 @@
 {
     "ping": "Pong! The latency is {ms}ms",
-    "inviteDescription": "Thanks for your interest in **Commie**!\n\nUse the buttons below to invite Commie to your server, join the official community, or explore other important project links.\n\nYour support helps drive new features, continuous improvements, and a better experience for everyone.\n\n❤️ See you around!",
-    "dashboardDescription": "Commie has a web dashboard that allows you to manage your server settings and customize your experience with ease. Access the dashboard using the button below.",
+    "inviteDescription": "Thanks for your interest in **Hawk**!\n\nUse the buttons below to invite Hawk to your server, join the official community, or explore other important project links.\n\nYour support helps drive new features, continuous improvements, and a better experience for everyone.\n\n❤️ See you around!",
+    "dashboardDescription": "Hawk has a web dashboard that allows you to manage your server settings and customize your experience with ease. Access the dashboard using the button below.",
     "info": {
         "created": "Created at",
         "joined": "Joined at",

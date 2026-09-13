@@ -1,4 +1,4 @@
--- B-Commie v2 — adds afk_status (missing from 0001_init.sql).
+-- B-Hawk v2 — adds afk_status (missing from 0001_init.sql).
 BEGIN;
 
 CREATE TABLE IF NOT EXISTS afk_status (

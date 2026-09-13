@@ -1,5 +1,5 @@
-"""Unit tests for bcommie.timeparse."""
-from bcommie.timeparse import ms_to_long, ms_to_short, parse_duration
+"""Unit tests for bhawk.timeparse."""
+from bhawk.timeparse import ms_to_long, ms_to_short, parse_duration
 
 
 def test_parse_single_unit():

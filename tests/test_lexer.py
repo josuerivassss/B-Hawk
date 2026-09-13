@@ -1,6 +1,6 @@
-"""Unit tests for bcommie.interpolation.lexer."""
-from bcommie.interpolation.lexer import lex
-from bcommie.interpolation.nodes import PlaceholderNode, TextNode
+"""Unit tests for bhawk.interpolation.lexer."""
+from bhawk.interpolation.lexer import lex
+from bhawk.interpolation.nodes import PlaceholderNode, TextNode
 
 
 def test_plain_text_produces_single_text_node():

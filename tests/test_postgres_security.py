@@ -1,11 +1,11 @@
-"""Unit tests for the SQL-injection defenses in bcommie.db.postgres.
+"""Unit tests for the SQL-injection defenses in bhawk.db.postgres.
 
 No real database connection is required: `_validate_*` are pure functions
 that run before any query is built.
 """
 import pytest
 
-from bcommie.db.postgres import PostgresDatabaseManager
+from bhawk.db.postgres import PostgresDatabaseManager
 
 
 @pytest.fixture
