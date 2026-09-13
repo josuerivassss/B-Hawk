@@ -56,7 +56,7 @@ async def _get_prefix(bot: HawkBot, message: discord.Message) -> list[str] | str
         return commands.when_mentioned(bot, message)
     prefix = await bot.db.get(table="guilds", id=message.guild.id, path="prefix")
     if prefix is None:
-        return commands.when_mentioned_or("hawk!", "c!", "c?")(bot, message)
+        return commands.when_mentioned_or("hawk!", "h!", "h?")(bot, message)
     return commands.when_mentioned_or(prefix)(bot, message)
 
 
